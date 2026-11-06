@@ -1,0 +1,82 @@
+name: Python Flask CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  build-test-deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Tests
+        run: |
+          pytest
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Configure SSH Key
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Copy Application
+        run: |
+          scp app.py requirements.txt \
+          ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/flask-app/
+
+      - name: Deploy Application
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            cd /opt/flask-app
+
+            python3 -m venv venv
+            ./venv/bin/pip install -r requirements.txt
+
+            sudo systemctl stop flask-app || true
+
+            sudo tee /etc/systemd/system/flask-app.service > /dev/null << 'SERVICE'
+            [Unit]
+            Description=Python Flask Application
+            After=network.target
+
+            [Service]
+            User=ubuntu
+            WorkingDirectory=/opt/flask-app
+            ExecStart=/opt/flask-app/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:5000 app:app
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICE
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable flask-app
+            sudo systemctl restart flask-app
+          EOF
+
+      - name: Verify Deployment
+        run: |
+          curl --retry 5 --retry-delay 5 \
+          --retry-connrefused \
+          http://${{ secrets.EC2_HOST }}:5000/health
